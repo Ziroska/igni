@@ -1,0 +1,16 @@
+IGNI Manager 5.0 Alpha 4.8 — Guest CRM
+
+Implemented:
+- Active table stores guestId in addition to guest name.
+- Selecting a CRM suggestion links the exact guest card by ID.
+- Entering a new guest name creates a CRM card automatically when the table opens.
+- Closing a table creates a completed VisitEntity record.
+- Every hookah and its tobacco mix are copied into CRM history.
+- Guest visit count, total hookahs, last visit, favorite strength, favorite brands and favorite flavors are updated automatically.
+- Guest card shows favorite brands/flavors, total hookahs and visit history.
+- Room migration 6 -> 7 preserves existing database content.
+
+Version:
+versionCode 18
+versionName 5.0-alpha4.8-guest-crm
+Room database 7
