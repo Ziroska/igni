@@ -11,8 +11,8 @@
       "type": "SINGLE",
       "filters": [],
       "attributes": [],
-      "versionCode": 20,
-      "versionName": "5.0-alpha4.8.2-multi-hookah-ux",
+      "versionCode": 22,
+      "versionName": "5.0-alpha4.8.4-shift-service-ux",
       "outputFile": "linked-resources-binary-format-debug.ap_"
     }
   ],
