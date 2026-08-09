@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="ru.igni.manager"
-    android:versionCode="20"
-    android:versionName="5.0-alpha4.8.2-multi-hookah-ux" >
+    android:versionCode="22"
+    android:versionName="5.0-alpha4.8.4-shift-service-ux" >
 
     <uses-sdk
         android:minSdkVersion="26"

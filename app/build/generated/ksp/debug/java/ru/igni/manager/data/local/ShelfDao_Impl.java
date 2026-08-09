@@ -722,7 +722,7 @@ public final class ShelfDao_Impl implements ShelfDao {
             + "        FROM tobacco_flavors f JOIN tobacco_brands b ON b.id = f.brandId\n"
             + "        LEFT JOIN tobacco_containers c ON c.flavorId = f.id\n"
             + "        WHERE f.isAvailable = 1 GROUP BY f.id\n"
-            + "        HAVING COALESCE(SUM(CASE WHEN c.isActive = 1 THEN c.remainingGrams ELSE 0 END), 0) > 0\n"
+            + "        HAVING COALESCE(SUM(CASE WHEN c.isActive = 1 THEN c.remainingGrams ELSE 0 END), 0) > 5.0\n"
             + "        ORDER BY b.name COLLATE NOCASE, f.name COLLATE NOCASE\n"
             + "    ";
     final RoomSQLiteQuery _statement = RoomSQLiteQuery.acquire(_sql, 0);

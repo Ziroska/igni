@@ -132,11 +132,18 @@ import android.os.Environment
 import android.provider.MediaStore
 import android.graphics.pdf.PdfDocument
 import android.graphics.Paint
+import android.media.AudioManager
+import android.media.ToneGenerator
+import android.content.Context
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 private const val COAL_INTERVAL_MS = 22 * 60 * 1000L
+private const val ELECTRONIC_INTERVAL_MS = 40 * 60 * 1000L
+private const val MAX_COAL_CHANGES = 4
+private const val SHIFT_PREFS = "igni_shift_service"
+private const val TABLE_PREFS = "igni_table_numbers"
 
 private data class DashboardItem(
     val route: String,
@@ -156,7 +163,8 @@ private val dashboardItems = listOf(
 
 private data class HallTable(
     val number: Int,
-    val zone: String
+    val zone: String,
+    val physicalNumber: Int = number
 )
 
 internal data class HookahMixComponent(
@@ -171,7 +179,9 @@ internal data class HookahSession(
     val bowlType: String,
     val strength: Int,
     val mix: List<HookahMixComponent>,
+    val secondaryMix: List<HookahMixComponent> = emptyList(),
     val startedAt: Long,
+    val deliveredAt: Long? = null,
     val lastCoalAt: Long,
     val coalChanges: Int = 0
 )
@@ -192,10 +202,10 @@ private class HallState {
         items.forEach { entity -> sessions[entity.tableNumber] = entity.toSession() }
     }
 
-    fun openTable(number: Int, guest: String, guestId: Long?, bowl: String, strength: Int, count: Int, mix: List<HookahMixComponent>): TableSession {
+    fun openTable(number: Int, guest: String, guestId: Long?, bowl: String, strength: Int, count: Int, mix: List<HookahMixComponent>, secondaryMix: List<HookahMixComponent> = emptyList()): TableSession {
         val now = System.currentTimeMillis()
         val hookahs = List(count.coerceAtLeast(1)) {
-            HookahSession(bowlType = bowl, strength = strength, mix = mix, startedAt = now, lastCoalAt = now)
+            HookahSession(bowlType = bowl, strength = strength, mix = mix, secondaryMix = secondaryMix, startedAt = now, deliveredAt = null, lastCoalAt = now)
         }
         return TableSession(
             guestName = guest.trim().ifBlank { "Гость" },
@@ -207,10 +217,12 @@ private class HallState {
     fun replaceCoal(number: Int, hookahIndex: Int): TableSession? {
         val current = sessions[number] ?: return null
         if (hookahIndex !in current.hookahs.indices) return null
+        val target = current.hookahs[hookahIndex]
+        if (target.deliveredAt == null || target.bowlType == "Электронная" || target.coalChanges >= MAX_COAL_CHANGES) return current
         val updatedHookahs = current.hookahs.mapIndexed { index, hookah ->
             if (index == hookahIndex) hookah.copy(
                 lastCoalAt = System.currentTimeMillis(),
-                coalChanges = hookah.coalChanges + 1
+                coalChanges = (hookah.coalChanges + 1).coerceAtMost(MAX_COAL_CHANGES)
             ) else hookah
         }
         return current.copy(hookahs = updatedHookahs).also { sessions[number] = it }
@@ -220,22 +232,52 @@ private class HallState {
         val current = sessions[number] ?: return null
         val source = current.hookahs.getOrNull(sourceIndex) ?: current.hookahs.lastOrNull() ?: return null
         val now = System.currentTimeMillis()
-        val added = source.copy(startedAt = now, lastCoalAt = now, coalChanges = 0)
+        val added = source.copy(startedAt = now, deliveredAt = null, lastCoalAt = now, coalChanges = 0)
         return current.copy(hookahs = current.hookahs + added).also { sessions[number] = it }
     }
 
-    fun addHookah(number: Int, bowl: String, strength: Int, mix: List<HookahMixComponent>): TableSession? {
+    fun addHookah(number: Int, bowl: String, strength: Int, mix: List<HookahMixComponent>, secondaryMix: List<HookahMixComponent> = emptyList()): TableSession? {
         val current = sessions[number] ?: return null
         val now = System.currentTimeMillis()
         val added = HookahSession(
             bowlType = bowl,
             strength = strength,
             mix = mix,
+            secondaryMix = secondaryMix,
             startedAt = now,
+            deliveredAt = null,
             lastCoalAt = now,
             coalChanges = 0
         )
         return current.copy(hookahs = current.hookahs + added).also { sessions[number] = it }
+    }
+
+    fun deliverHookah(number: Int, hookahIndex: Int): TableSession? {
+        val current = sessions[number] ?: return null
+        if (hookahIndex !in current.hookahs.indices) return null
+        val target = current.hookahs[hookahIndex]
+        if (target.deliveredAt != null) return current
+        val now = System.currentTimeMillis()
+        val updated = current.copy(hookahs = current.hookahs.mapIndexed { index, hookah ->
+            if (index == hookahIndex) hookah.copy(deliveredAt = now, lastCoalAt = now, coalChanges = 0) else hookah
+        })
+        sessions[number] = updated
+        return updated
+    }
+
+    fun moveTable(fromNumber: Int, toNumber: Int): TableSession? {
+        if (fromNumber == toNumber || sessions.containsKey(toNumber)) return null
+        val current = sessions.remove(fromNumber) ?: return null
+        sessions[toNumber] = current
+        return current
+    }
+
+    fun renameTableSession(fromNumber: Int, toNumber: Int): TableSession? {
+        if (fromNumber == toNumber) return sessions[fromNumber]
+        if (sessions.containsKey(toNumber)) return null
+        val current = sessions.remove(fromNumber) ?: return null
+        sessions[toNumber] = current
+        return current
     }
 
     fun removeHookah(number: Int, hookahIndex: Int): TableSession? {
@@ -265,28 +307,36 @@ private suspend fun saveVisitToCrm(crmDao: CrmDao, tableNumber: Int, session: Ta
         )
     )
     session.hookahs.forEach { hookah ->
-        val hookahId = crmDao.createHookahWithMix(
-            HookahHistoryEntity(
-                visitId = visitId,
-                guestId = guestId,
-                tableNumber = tableNumber,
-                bowlType = hookah.bowlType,
-                strength = hookah.strength,
-                startedAt = hookah.startedAt,
-                closedAt = closedAt,
-                status = "CLOSED"
-            ),
-            hookah.mix.map { component ->
-                HookahMixItemEntity(
-                    hookahId = 0,
-                    flavorId = component.flavorId,
-                    brandNameSnapshot = component.brandName,
-                    flavorNameSnapshot = component.flavorName,
-                    percentage = component.percent,
-                    grams = component.grams
-                )
-            }
-        )
+        suspend fun saveHistoryBowl(label: String, mix: List<HookahMixComponent>) {
+            crmDao.createHookahWithMix(
+                HookahHistoryEntity(
+                    visitId = visitId,
+                    guestId = guestId,
+                    tableNumber = tableNumber,
+                    bowlType = label,
+                    strength = hookah.strength,
+                    startedAt = hookah.startedAt,
+                    closedAt = closedAt,
+                    status = "CLOSED"
+                ),
+                mix.map { component ->
+                    HookahMixItemEntity(
+                        hookahId = 0,
+                        flavorId = component.flavorId,
+                        brandNameSnapshot = component.brandName,
+                        flavorNameSnapshot = component.flavorName,
+                        percentage = component.percent,
+                        grams = component.grams
+                    )
+                }
+            )
+        }
+        if (hookah.bowlType == "Электронная" && hookah.secondaryMix.isNotEmpty()) {
+            saveHistoryBowl("Электронная • Чаша A", hookah.mix)
+            saveHistoryBowl("Электронная • Чаша B", hookah.secondaryMix)
+        } else {
+            saveHistoryBowl(hookah.bowlType, hookah.mix)
+        }
     }
     crmDao.updateGuestAfterVisit(
         guestId = guestId,
@@ -329,22 +379,67 @@ private fun deserializeMix(value: String): List<HookahMixComponent> = value.line
 }.toList()
 
 private fun serializeHookahs(hookahs: List<HookahSession>): String = buildString {
-    append("H43\n")
+    append("H484\n")
     hookahs.forEachIndexed { index, hookah ->
         if (index > 0) append("\n---HOOKAH---\n")
         append(listOf(
             encodeText(hookah.bowlType),
             hookah.strength.toString(),
             hookah.startedAt.toString(),
+            (hookah.deliveredAt ?: 0L).toString(),
             hookah.lastCoalAt.toString(),
             hookah.coalChanges.toString()
         ).joinToString("|"))
         append("\n")
         append(serializeMix(hookah.mix))
+        if (hookah.secondaryMix.isNotEmpty()) {
+            append("\n---SECONDARY-MIX---\n")
+            append(serializeMix(hookah.secondaryMix))
+        }
     }
 }
 
 private fun deserializeHookahs(value: String): List<HookahSession> {
+    if (value.startsWith("H484\n")) {
+        return value.removePrefix("H484\n").split("\n---HOOKAH---\n").mapNotNull { block ->
+            val sections = block.split("\n---SECONDARY-MIX---\n", limit = 2)
+            val lines = sections[0].lines()
+            val meta = lines.firstOrNull()?.split('|') ?: return@mapNotNull null
+            if (meta.size != 6) return@mapNotNull null
+            runCatching {
+                HookahSession(
+                    bowlType = decodeText(meta[0]),
+                    strength = meta[1].toInt(),
+                    startedAt = meta[2].toLong(),
+                    deliveredAt = meta[3].toLong().takeIf { it > 0L },
+                    lastCoalAt = meta[4].toLong(),
+                    coalChanges = meta[5].toInt().coerceAtMost(MAX_COAL_CHANGES),
+                    mix = deserializeMix(lines.drop(1).joinToString("\n")),
+                    secondaryMix = sections.getOrNull(1)?.let(::deserializeMix) ?: emptyList()
+                )
+            }.getOrNull()
+        }
+    }
+    if (value.startsWith("H483\n")) {
+        return value.removePrefix("H483\n").split("\n---HOOKAH---\n").mapNotNull { block ->
+            val sections = block.split("\n---SECONDARY-MIX---\n", limit = 2)
+            val lines = sections[0].lines()
+            val meta = lines.firstOrNull()?.split('|') ?: return@mapNotNull null
+            if (meta.size != 5) return@mapNotNull null
+            runCatching {
+                HookahSession(
+                    bowlType = decodeText(meta[0]),
+                    strength = meta[1].toInt(),
+                    startedAt = meta[2].toLong(),
+                    deliveredAt = meta[3].toLong(),
+                    lastCoalAt = meta[3].toLong(),
+                    coalChanges = meta[4].toInt().coerceAtMost(MAX_COAL_CHANGES),
+                    mix = deserializeMix(lines.drop(1).joinToString("\n")),
+                    secondaryMix = sections.getOrNull(1)?.let(::deserializeMix) ?: emptyList()
+                )
+            }.getOrNull()
+        }
+    }
     if (!value.startsWith("H43\n")) return emptyList()
     return value.removePrefix("H43\n").split("\n---HOOKAH---\n").mapNotNull { block ->
         val lines = block.lines()
@@ -355,8 +450,9 @@ private fun deserializeHookahs(value: String): List<HookahSession> {
                 bowlType = decodeText(meta[0]),
                 strength = meta[1].toInt(),
                 startedAt = meta[2].toLong(),
+                deliveredAt = meta[3].toLong(),
                 lastCoalAt = meta[3].toLong(),
-                coalChanges = meta[4].toInt(),
+                coalChanges = meta[4].toInt().coerceAtMost(MAX_COAL_CHANGES),
                 mix = deserializeMix(lines.drop(1).joinToString("\n"))
             )
         }.getOrNull()
@@ -387,8 +483,9 @@ private fun ActiveTableSessionEntity.toSession(): TableSession {
             strength = strength,
             mix = deserializeMix(mixData),
             startedAt = startedAt,
+            deliveredAt = lastCoalAt,
             lastCoalAt = lastCoalAt,
-            coalChanges = coalChanges
+            coalChanges = coalChanges.coerceAtMost(MAX_COAL_CHANGES)
         )
         List(hookahCount.coerceAtLeast(1)) { legacy }
     }
@@ -428,7 +525,7 @@ private fun HomeScreen(onOpen: (String) -> Unit) {
                     Column {
                         Text("IGNI MANAGER", fontWeight = FontWeight.Bold)
                         Text(
-                            "5.0 • Alpha 4.8",
+                            "5.0 • Alpha 4.8.4",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.primary
                         )
@@ -498,16 +595,32 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
     val favoriteMixes by hallDao.observeFavoriteMixes().collectAsState(initial = emptyList())
     val scope = rememberCoroutineScope()
     val snackbarHostState = remember { SnackbarHostState() }
-
-    val tables = buildList {
-        add(HallTable(77, "Основной зал"))
-        (101..114).forEach { add(HallTable(it, "Основной зал")) }
-        (301..308).forEach { add(HallTable(it, "Летняя веранда")) }
+    val shiftPrefs = remember { context.getSharedPreferences(SHIFT_PREFS, Context.MODE_PRIVATE) }
+    val tablePrefs = remember { context.getSharedPreferences(TABLE_PREFS, Context.MODE_PRIVATE) }
+    var shiftStartedAt by remember { mutableLongStateOf(shiftPrefs.getLong("startedAt", 0L)) }
+    var shiftHookahCount by remember { mutableStateOf(shiftPrefs.getInt("hookahCount", 0)) }
+    val shiftOpen = shiftStartedAt > 0L
+    var tableConfigVersion by remember { mutableStateOf(0) }
+    val tables = remember(tableConfigVersion) {
+        buildList {
+            fun configured(physical: Int, zone: String) = HallTable(
+                number = tablePrefs.getInt("table_$physical", physical),
+                zone = zone,
+                physicalNumber = physical
+            )
+            add(configured(77, "Основной зал"))
+            (101..114).forEach { add(configured(it, "Основной зал")) }
+            (301..308).forEach { add(configured(it, "Летняя веранда")) }
+        }
     }
     var selectedZone by remember { mutableStateOf("Основной зал") }
     var selectedTable by remember { mutableStateOf<HallTable?>(null) }
     var addHookahTable by remember { mutableStateOf<HallTable?>(null) }
     var quickActionTable by remember { mutableStateOf<HallTable?>(null) }
+    var moveTableFrom by remember { mutableStateOf<HallTable?>(null) }
+    var renameTable by remember { mutableStateOf<HallTable?>(null) }
+    var renameNumber by remember { mutableStateOf("") }
+    val playedAlerts = remember { mutableStateMapOf<String, Boolean>() }
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(persistedSessions) {
         hallState.restore(persistedSessions)
@@ -520,6 +633,22 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
         }
     }
 
+    LaunchedEffect(now) {
+        hallState.sessions.forEach { (tableNumber, session) ->
+            session.hookahs.forEachIndexed { index, hookah ->
+                val delivered = hookah.deliveredAt ?: return@forEachIndexed
+                val interval = serviceIntervalMs(hookah)
+                val reference = if (hookah.bowlType == "Электронная") delivered else hookah.lastCoalAt
+                val due = now - reference >= interval && (hookah.bowlType == "Электронная" || hookah.coalChanges < MAX_COAL_CHANGES)
+                val alertKey = "$tableNumber:$index:${hookah.coalChanges}:$reference"
+                if (due && playedAlerts[alertKey] != true) {
+                    playedAlerts[alertKey] = true
+                    playServiceAlert()
+                }
+            }
+        }
+    }
+
     Scaffold(
         snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
@@ -528,7 +657,7 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                     Column {
                         Text("Зал", fontWeight = FontWeight.Bold)
                         Text(
-                            "Свободно: ${tables.size - hallState.sessions.size} • Занято: ${hallState.sessions.size}",
+                            "Свободно: ${tables.size - hallState.sessions.size} • Занято: ${hallState.sessions.size} • За смену: $shiftHookahCount",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.primary
                         )
@@ -536,6 +665,22 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                 },
                 navigationIcon = {
                     TextButton(onClick = onBack, modifier = Modifier.padding(start = 8.dp)) { Text("Назад") }
+                },
+                actions = {
+                    if (shiftOpen) {
+                        OutlinedButton(onClick = {
+                            val closedCount = shiftHookahCount
+                            shiftStartedAt = 0L
+                            shiftPrefs.edit().putLong("startedAt", 0L).putInt("lastClosedHookahs", closedCount).apply()
+                            scope.launch { snackbarHostState.showSnackbar("Смена закрыта • кальянов: $closedCount") }
+                        }) { Text("Закрыть смену") }
+                    } else {
+                        Button(onClick = {
+                            shiftStartedAt = System.currentTimeMillis()
+                            shiftHookahCount = 0
+                            shiftPrefs.edit().putLong("startedAt", shiftStartedAt).putInt("hookahCount", 0).apply()
+                        }) { Text("Открыть смену") }
+                    }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
@@ -558,7 +703,7 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                     now = now,
                     onTableClick = { selectedTable = it },
                     onTableLongClick = { quickActionTable = it },
-                    modifier = Modifier.weight(0.76f).fillMaxHeight()
+                    modifier = Modifier.weight(0.62f).fillMaxHeight()
                 )
                 val activeTable = selectedTable
                 val activeSession = activeTable?.let { hallState.sessions[it.number] }
@@ -568,6 +713,23 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                         session = activeSession,
                         now = now,
                         modifier = Modifier.weight(0.24f).fillMaxHeight(),
+                        shiftOpen = shiftOpen,
+                        onDeliver = { hookahIndex ->
+                            scope.launch {
+                                val before = hallState.sessions[activeTable.number]?.hookahs?.getOrNull(hookahIndex)
+                                if (!shiftOpen) {
+                                    snackbarHostState.showSnackbar("Сначала открой смену")
+                                    return@launch
+                                }
+                                hallState.deliverHookah(activeTable.number, hookahIndex)?.let { updated ->
+                                    hallDao.saveSession(updated.toEntity(activeTable.number))
+                                    if (before?.deliveredAt == null) {
+                                        shiftHookahCount += 1
+                                        shiftPrefs.edit().putInt("hookahCount", shiftHookahCount).apply()
+                                    }
+                                }
+                            }
+                        },
                         onCoal = { hookahIndex ->
                             scope.launch {
                                 hallState.replaceCoal(activeTable.number, hookahIndex)?.let { hallDao.saveSession(it.toEntity(activeTable.number)) }
@@ -583,6 +745,7 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                                 try {
                                     database.withTransaction {
                                         source.mix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams) }
+                                        source.secondaryMix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams) }
                                         hallState.addRepeatedHookah(activeTable.number, hookahIndex)
                                             ?.let { hallDao.saveSession(it.toEntity(activeTable.number)) }
                                     }
@@ -596,6 +759,11 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                             scope.launch {
                                 hallState.removeHookah(activeTable.number, hookahIndex)?.let { hallDao.saveSession(it.toEntity(activeTable.number)) }
                             }
+                        },
+                        onMove = { moveTableFrom = activeTable },
+                        onRename = {
+                            renameTable = activeTable
+                            renameNumber = activeTable.number.toString()
                         },
                         onClose = {
                             scope.launch {
@@ -628,6 +796,13 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                         }
                     }
                 }
+                ActiveTablesRail(
+                    tables = tables,
+                    sessions = hallState.sessions,
+                    selectedTableNumber = selectedTable?.number,
+                    onSelect = { table -> selectedZone = table.zone; selectedTable = table },
+                    modifier = Modifier.width(168.dp).fillMaxHeight()
+                )
             }
             HallLegendHorizontal()
         }
@@ -647,15 +822,34 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                         }
                     } else {
                         Text("${session.guestName} • кальянов: ${session.hookahCount}")
-                        Button(onClick = {
-                            scope.launch { hallState.replaceCoal(table.number, 0)?.let { hallDao.saveSession(it.toEntity(table.number)) } }
-                            quickActionTable = null
-                        }, modifier = Modifier.fillMaxWidth()) { Text("Заменить угли") }
+                        val quickHookah = session.hookahs.first()
+                        if (quickHookah.deliveredAt == null) {
+                            Button(onClick = {
+                                scope.launch {
+                                    if (!shiftOpen) {
+                                        snackbarHostState.showSnackbar("Сначала открой смену")
+                                    } else {
+                                        hallState.deliverHookah(table.number, 0)?.let { hallDao.saveSession(it.toEntity(table.number)) }
+                                        shiftHookahCount += 1
+                                        shiftPrefs.edit().putInt("hookahCount", shiftHookahCount).apply()
+                                    }
+                                }
+                                quickActionTable = null
+                            }, modifier = Modifier.fillMaxWidth()) { Text("Отдать кальян") }
+                        } else if (quickHookah.bowlType != "Электронная") {
+                            Button(onClick = {
+                                scope.launch { hallState.replaceCoal(table.number, 0)?.let { hallDao.saveSession(it.toEntity(table.number)) } }
+                                quickActionTable = null
+                            }, enabled = quickHookah.coalChanges < MAX_COAL_CHANGES, modifier = Modifier.fillMaxWidth()) {
+                                Text(if (quickHookah.coalChanges >= MAX_COAL_CHANGES) "Лимит замен достигнут" else "Заменить угли")
+                            }
+                        }
                         OutlinedButton(onClick = {
                             scope.launch {
                                 try {
                                     database.withTransaction {
                                         session.hookahs.last().mix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams) }
+                                        session.hookahs.last().secondaryMix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams) }
                                         hallState.addRepeatedHookah(table.number, session.hookahs.lastIndex)?.let { hallDao.saveSession(it.toEntity(table.number)) }
                                     }
                                     snackbarHostState.showSnackbar("Повторный кальян добавлен")
@@ -685,6 +879,76 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
         )
     }
 
+    moveTableFrom?.let { fromTable ->
+        val freeTables = tables.filter { it.number != fromTable.number && hallState.sessions[it.number] == null }
+        AlertDialog(
+            onDismissRequest = { moveTableFrom = null },
+            title = { Text("Перенести стол ${fromTable.number}") },
+            text = {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.heightIn(max = 420.dp)) {
+                    lazyItems(freeTables, key = { it.physicalNumber }) { destination ->
+                        OutlinedButton(onClick = {
+                            scope.launch {
+                                val moved = hallState.moveTable(fromTable.number, destination.number)
+                                if (moved != null) {
+                                    hallDao.deleteSession(fromTable.number)
+                                    hallDao.saveSession(moved.toEntity(destination.number))
+                                    selectedZone = destination.zone
+                                    selectedTable = destination
+                                    snackbarHostState.showSnackbar("Стол ${fromTable.number} перенесён на ${destination.number}")
+                                }
+                                moveTableFrom = null
+                            }
+                        }, modifier = Modifier.fillMaxWidth()) { Text("Стол ${destination.number} • ${destination.zone}") }
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = { TextButton(onClick = { moveTableFrom = null }) { Text("Отмена") } }
+        )
+    }
+
+    renameTable?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renameTable = null },
+            title = { Text("Изменить номер стола ${target.number}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        value = renameNumber,
+                        onValueChange = { renameNumber = it.filter(Char::isDigit).take(4) },
+                        label = { Text("Новый номер") },
+                        singleLine = true
+                    )
+                    Text("Меняется номер этой позиции на схеме. История прошлых визитов остаётся с прежним номером.", style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    val newNumber = renameNumber.toIntOrNull()
+                    when {
+                        newNumber == null || newNumber <= 0 -> scope.launch { snackbarHostState.showSnackbar("Укажи корректный номер") }
+                        tables.any { it.physicalNumber != target.physicalNumber && it.number == newNumber } -> scope.launch { snackbarHostState.showSnackbar("Стол $newNumber уже существует") }
+                        else -> scope.launch {
+                            val oldNumber = target.number
+                            tablePrefs.edit().putInt("table_${target.physicalNumber}", newNumber).apply()
+                            hallState.renameTableSession(oldNumber, newNumber)?.let { moved ->
+                                hallDao.deleteSession(oldNumber)
+                                hallDao.saveSession(moved.toEntity(newNumber))
+                            }
+                            tableConfigVersion += 1
+                            val updated = HallTable(newNumber, target.zone, target.physicalNumber)
+                            selectedTable = updated
+                            renameTable = null
+                            snackbarHostState.showSnackbar("Стол $oldNumber теперь имеет номер $newNumber")
+                        }
+                    }
+                }) { Text("Сохранить") }
+            },
+            dismissButton = { TextButton(onClick = { renameTable = null }) { Text("Отмена") } }
+        )
+    }
+
     addHookahTable?.let { table ->
         TableDialog(
             table = table,
@@ -695,12 +959,13 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
             favoriteMixes = favoriteMixes,
             addingHookah = true,
             onDismiss = { addHookahTable = null },
-            onStart = { _, _, bowl, strength, _, mix ->
+            onStart = { _, _, bowl, strength, _, mix, secondaryMix ->
                 scope.launch {
                     try {
                         database.withTransaction {
                             mix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams) }
-                            hallState.addHookah(table.number, bowl, strength, mix)
+                            secondaryMix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams) }
+                            hallState.addHookah(table.number, bowl, strength, mix, secondaryMix)
                                 ?.let { hallDao.saveSession(it.toEntity(table.number)) }
                         }
                         addHookahTable = null
@@ -734,15 +999,16 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
             mixOptions = mixOptions,
             favoriteMixes = favoriteMixes,
             onDismiss = { selectedTable = null },
-            onStart = { guest, selectedGuestId, bowl, strength, count, mix ->
+            onStart = { guest, selectedGuestId, bowl, strength, count, mix, secondaryMix ->
                 scope.launch {
                     try {
                         database.withTransaction {
                             mix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams * count) }
+                            secondaryMix.forEach { shelfDao.deductFlavorOrThrow(it.flavorId, it.grams * count) }
                             val linkedGuestId = selectedGuestId ?: guest.trim().takeIf { it.isNotBlank() }?.let { name ->
                                 crmDao.insertGuest(GuestEntity(name = name))
                             }
-                            val session = hallState.openTable(table.number, guest, linkedGuestId, bowl, strength, count, mix)
+                            val session = hallState.openTable(table.number, guest, linkedGuestId, bowl, strength, count, mix, secondaryMix)
                             hallDao.saveSession(session.toEntity(table.number))
                         }
                         selectedTable = null
@@ -855,7 +1121,7 @@ private fun PremiumHallMap(
             )
             if (zone == "Основной зал") MainHallDecor(mapWidth, mapHeight) else VerandaDecor(mapWidth, mapHeight)
             specs.forEach { spec ->
-                val table = tables.firstOrNull { it.number == spec.number } ?: return@forEach
+                val table = tables.firstOrNull { it.physicalNumber == spec.number } ?: return@forEach
                 FloorTableNode(
                     spec = spec,
                     table = table,
@@ -959,20 +1225,25 @@ private fun FloorTableNode(
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
-    val activeHookah = session?.hookahs?.maxByOrNull { now - it.lastCoalAt }
-    val elapsed = activeHookah?.let { now - it.lastCoalAt } ?: 0L
+    val activeHookah = session?.hookahs?.maxByOrNull { hookah ->
+        if (hookah.deliveredAt == null) Long.MIN_VALUE else now - serviceReferenceAt(hookah)
+    }
+    val interval = activeHookah?.let(::serviceIntervalMs) ?: COAL_INTERVAL_MS
+    val elapsed = activeHookah?.takeIf { it.deliveredAt != null }?.let { now - serviceReferenceAt(it) } ?: 0L
     val borderColor = when {
         session == null -> Color(0xFF987243)
-        elapsed >= COAL_INTERVAL_MS -> Color(0xFFE15454)
-        elapsed >= COAL_INTERVAL_MS - 3 * 60_000L -> Color(0xFFD7A63A)
+        activeHookah?.deliveredAt == null -> Color(0xFF8A7A63)
+        elapsed >= interval -> Color(0xFFE15454)
+        elapsed >= interval - 3 * 60_000L -> Color(0xFFD7A63A)
         else -> Color(0xFF4DA365)
     }
     val shape = if (spec.shape == FloorTableShape.ROUND) CircleShape else RoundedCornerShape(if (spec.shape == FloorTableShape.WIDE) 14.dp else 10.dp)
     val selectedScale by animateFloatAsState(if (selected) 1.07f else 1f, label = "tableScale")
     val surfaceColor = when {
         session == null -> Color(0xFF242526)
-        elapsed >= COAL_INTERVAL_MS -> Color(0xFF351F20)
-        elapsed >= COAL_INTERVAL_MS - 3 * 60_000L -> Color(0xFF332A1C)
+        activeHookah?.deliveredAt == null -> Color(0xFF292725)
+        elapsed >= interval -> Color(0xFF351F20)
+        elapsed >= interval - 3 * 60_000L -> Color(0xFF332A1C)
         else -> Color(0xFF1E2C23)
     }
     Card(
@@ -995,9 +1266,9 @@ private fun FloorTableNode(
             Text(table.number.toString(), fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, color = if (selected) Color(0xFFF3D18B) else Color.White)
             if (session != null) {
                 Text(session.guestName, style = MaterialTheme.typography.labelSmall, maxLines = 1, textAlign = TextAlign.Center)
-                Text(coalTimerText(activeHookah ?: session.hookahs.first(), now), style = MaterialTheme.typography.labelSmall, color = borderColor, textAlign = TextAlign.Center)
+                Text(serviceTimerText(activeHookah ?: session.hookahs.first(), now), style = MaterialTheme.typography.labelSmall, color = borderColor, textAlign = TextAlign.Center)
                 if (session.hookahCount > 1) {
-                    Text("•".repeat(session.hookahCount.coerceAtMost(4)), color = Color(0xFFE5C17A), style = MaterialTheme.typography.labelSmall)
+                    Text("🔥${session.hookahCount}", color = Color(0xFFE5C17A), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
                 }
             }
         }
@@ -1075,15 +1346,58 @@ private fun LegendRow(color: Color, text: String) {
 }
 
 @Composable
+private fun ActiveTablesRail(
+    tables: List<HallTable>,
+    sessions: Map<Int, TableSession>,
+    selectedTableNumber: Int?,
+    onSelect: (HallTable) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Card(
+        modifier = modifier,
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF141414)),
+        border = BorderStroke(1.dp, Color(0xFF3A3328)),
+        shape = RoundedCornerShape(18.dp)
+    ) {
+        Column(Modifier.fillMaxSize().padding(10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("АКТИВНЫЕ", color = Color(0xFFE5C17A), fontWeight = FontWeight.Bold)
+            Text("${sessions.size} столов", color = Color.White.copy(alpha = 0.55f), style = MaterialTheme.typography.labelSmall)
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                val active = tables.filter { sessions.containsKey(it.number) }.sortedBy { it.number }
+                lazyItems(active, key = { it.physicalNumber }) { table ->
+                    val session = sessions[table.number] ?: return@lazyItems
+                    val selected = selectedTableNumber == table.number
+                    Card(
+                        onClick = { onSelect(table) },
+                        colors = CardDefaults.cardColors(containerColor = if (selected) Color(0xFF332A1C) else Color(0xFF202020)),
+                        border = BorderStroke(1.dp, if (selected) Color(0xFFE5C17A) else Color(0xFF3A3328))
+                    ) {
+                        Column(Modifier.fillMaxWidth().padding(8.dp)) {
+                            Text("${table.number}", color = Color.White, fontWeight = FontWeight.Bold)
+                            Text(session.guestName, color = Color.White.copy(alpha = 0.72f), maxLines = 1, style = MaterialTheme.typography.labelSmall)
+                            Text("🔥${session.hookahCount}", color = Color(0xFFE5C17A), style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ActiveTableSidePanel(
     table: HallTable,
     session: TableSession,
     now: Long,
     modifier: Modifier = Modifier,
+    shiftOpen: Boolean,
+    onDeliver: (Int) -> Unit,
     onCoal: (Int) -> Unit,
     onRepeat: (Int) -> Unit,
     onDuplicate: (Int) -> Unit,
     onRemove: (Int) -> Unit,
+    onMove: () -> Unit,
+    onRename: () -> Unit,
     onClose: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -1092,11 +1406,15 @@ private fun ActiveTableSidePanel(
         if (selectedHookah > session.hookahs.lastIndex) selectedHookah = session.hookahs.lastIndex.coerceAtLeast(0)
     }
     val hookah = session.hookahs.getOrNull(selectedHookah) ?: session.hookahs.first()
-    val elapsed = (now - hookah.lastCoalAt).coerceAtLeast(0L)
-    val progress = (elapsed.toFloat() / COAL_INTERVAL_MS.toFloat()).coerceIn(0f, 1f)
+    val interval = serviceIntervalMs(hookah)
+    val elapsed = if (hookah.deliveredAt == null) 0L else (now - serviceReferenceAt(hookah)).coerceAtLeast(0L)
+    val progress = if (hookah.deliveredAt == null) 0f else (elapsed.toFloat() / interval.toFloat()).coerceIn(0f, 1f)
     val statusColor = when {
-        elapsed >= COAL_INTERVAL_MS -> Color(0xFFE15454)
-        elapsed >= COAL_INTERVAL_MS - 3 * 60_000L -> Color(0xFFD7A63A)
+        hookah.deliveredAt == null -> Color(0xFF8A7A63)
+        hookah.bowlType != "Электронная" && hookah.coalChanges >= 4 -> Color(0xFFE15454)
+        hookah.bowlType != "Электронная" && hookah.coalChanges >= 3 -> Color(0xFFE58A3A)
+        elapsed >= interval -> Color(0xFFE15454)
+        elapsed >= interval - 3 * 60_000L -> Color(0xFFD7A63A)
         else -> Color(0xFF4DA365)
     }
 
@@ -1146,9 +1464,20 @@ private fun ActiveTableSidePanel(
                     )
                 }
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(coalTimerText(hookah, now), color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.headlineMedium)
-                    Text("до замены углей", color = statusColor, style = MaterialTheme.typography.labelMedium)
-                    Text("замен: ${hookah.coalChanges}", color = Color.White.copy(alpha = 0.5f), style = MaterialTheme.typography.labelSmall)
+                    Text(serviceTimerText(hookah, now), color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.headlineMedium)
+                    Text(
+                        when {
+                            hookah.deliveredAt == null -> "кальян готовится"
+                            hookah.bowlType == "Электронная" -> "таймер электронной чаши • 40 мин"
+                            else -> "до замены углей"
+                        },
+                        color = statusColor,
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    if (hookah.bowlType != "Электронная") {
+                        Text("замен: ${hookah.coalChanges} / $MAX_COAL_CHANGES", color = statusColor, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
+                        Text("●".repeat(hookah.coalChanges) + "○".repeat((MAX_COAL_CHANGES - hookah.coalChanges).coerceAtLeast(0)), color = statusColor, style = MaterialTheme.typography.titleMedium)
+                    }
                 }
             }
 
@@ -1167,19 +1496,49 @@ private fun ActiveTableSidePanel(
                                 Text("${item.percent}%", color = Color(0xFFE5C17A), style = MaterialTheme.typography.bodySmall)
                             }
                         }
+                        if (hookah.bowlType == "Электронная" && hookah.secondaryMix.isNotEmpty()) {
+                            Divider(color = Color.White.copy(alpha = 0.12f))
+                            Text("Чаша B", color = Color(0xFFE5C17A), fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelMedium)
+                            hookah.secondaryMix.take(4).forEach { item ->
+                                Row(Modifier.fillMaxWidth()) {
+                                    Text("${item.brandName} ${item.flavorName}", color = Color.White.copy(alpha = 0.82f), modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                                    Text("${item.percent}%", color = Color(0xFFE5C17A), style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
                     }
                 }
             }
 
             Spacer(Modifier.height(4.dp))
-            Button(onClick = { onCoal(selectedHookah) }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
-                Text("Заменить угли")
+            if (hookah.deliveredAt == null) {
+                Button(
+                    onClick = { onDeliver(selectedHookah) },
+                    enabled = shiftOpen,
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) { Text(if (shiftOpen) "Отдать кальян" else "Сначала открой смену") }
+            } else if (hookah.bowlType != "Электронная") {
+                Button(
+                    onClick = { onCoal(selectedHookah) },
+                    enabled = hookah.coalChanges < MAX_COAL_CHANGES,
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) {
+                    Text(if (hookah.coalChanges >= MAX_COAL_CHANGES) "Лимит замен достигнут" else "Заменить угли")
+                }
+            } else {
+                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF211F1B))) {
+                    Text("Электронная чаша: сервисный таймер 40 минут", modifier = Modifier.fillMaxWidth().padding(12.dp), color = Color(0xFFE5C17A), textAlign = TextAlign.Center)
+                }
             }
             OutlinedButton(onClick = { onRepeat(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
                 Text("Добавить новый кальян")
             }
             TextButton(onClick = { onDuplicate(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
                 Text("Дублировать текущий кальян")
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onMove, modifier = Modifier.weight(1f)) { Text("Перенести") }
+                OutlinedButton(onClick = onRename, modifier = Modifier.weight(1f)) { Text("Номер") }
             }
             if (session.hookahCount > 1) {
                 TextButton(onClick = { onRemove(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
@@ -1203,7 +1562,7 @@ private fun TableDialog(
     mixOptions: List<MixFlavorOption>,
     favoriteMixes: List<FavoriteMixEntity>,
     onDismiss: () -> Unit,
-    onStart: (String, Long?, String, Int, Int, List<HookahMixComponent>) -> Unit,
+    onStart: (String, Long?, String, Int, Int, List<HookahMixComponent>, List<HookahMixComponent>) -> Unit,
     onSaveFavorite: (String, List<HookahMixComponent>) -> Unit,
     onDeleteFavorite: (FavoriteMixEntity) -> Unit,
     onCoal: (Int) -> Unit,
@@ -1220,6 +1579,8 @@ private fun TableDialog(
         var search by remember { mutableStateOf("") }
         var flavorPickerOpen by remember { mutableStateOf(false) }
         var selectedMix by remember { mutableStateOf<List<Pair<MixFlavorOption, Int>>>(emptyList()) }
+        var selectedMixB by remember { mutableStateOf<List<Pair<MixFlavorOption, Int>>>(emptyList()) }
+        var activeElectronicBowl by remember { mutableStateOf("A") }
         var favoriteName by remember { mutableStateOf("") }
         var guestSuggestionsExpanded by remember { mutableStateOf(false) }
         val context = LocalContext.current
@@ -1231,12 +1592,19 @@ private fun TableDialog(
         val bowlWeight = bowlWeightGrams(bowl)
         val effectiveHookahCount = 1
         val totalPercent = selectedMix.sumOf { it.second }
+        val totalPercentB = selectedMixB.sumOf { it.second }
         val calculatedMix = calculateMix(selectedMix, bowlWeight)
-        val enoughStock = calculatedMix.all { component ->
-            val option = mixOptions.firstOrNull { it.flavorId == component.flavorId }
-            option != null && option.totalGrams + 0.0001 >= component.grams * effectiveHookahCount
+        val calculatedMixB = if (bowl == "Электронная") calculateMix(selectedMixB, bowlWeight) else emptyList()
+        val allCalculated = calculatedMix + calculatedMixB
+        val enoughStock = allCalculated.groupBy { it.flavorId }.all { (flavorId, components) ->
+            val option = mixOptions.firstOrNull { it.flavorId == flavorId }
+            option != null && option.totalGrams + 0.0001 >= components.sumOf { it.grams } * effectiveHookahCount
         }
-        val canStart = selectedMix.isNotEmpty() && totalPercent == 100 && enoughStock
+        val primaryReady = selectedMix.isNotEmpty() && totalPercent == 100
+        val secondaryReady = bowl != "Электронная" || (selectedMixB.isNotEmpty() && totalPercentB == 100)
+        val canStart = primaryReady && secondaryReady && enoughStock
+        val editingMix = if (bowl == "Электронная" && activeElectronicBowl == "B") selectedMixB else selectedMix
+        val editingCalculatedMix = if (bowl == "Электронная" && activeElectronicBowl == "B") calculatedMixB else calculatedMix
 
         AlertDialog(
             onDismissRequest = onDismiss,
@@ -1309,8 +1677,8 @@ private fun TableDialog(
                         Text("Тип чаши • ${formatGrams(bowlWeight)}", fontWeight = FontWeight.SemiBold)
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             listOf("Классическая", "Фруктовая", "Электронная", "Авторская").forEach { option ->
-                                if (bowl == option) Button(onClick = { bowl = option }) { Text(option) }
-                                else OutlinedButton(onClick = { bowl = option }) { Text(option) }
+                                if (bowl == option) Button(onClick = { bowl = option; if (option != "Электронная") activeElectronicBowl = "A" }) { Text(option) }
+                                else OutlinedButton(onClick = { bowl = option; if (option != "Электронная") activeElectronicBowl = "A" }) { Text(option) }
                             }
                         }
                     }
@@ -1331,8 +1699,19 @@ private fun TableDialog(
                         }
                     }
                     item { Divider() }
+                    if (bowl == "Электронная") {
+                        item {
+                            Text("Электронная чаша состоит из двух чашек — настрой оба микса отдельно.", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                                if (activeElectronicBowl == "A") Button(onClick = { activeElectronicBowl = "A" }, modifier = Modifier.weight(1f)) { Text("Чаша A • $totalPercent%") }
+                                else OutlinedButton(onClick = { activeElectronicBowl = "A" }, modifier = Modifier.weight(1f)) { Text("Чаша A • $totalPercent%") }
+                                if (activeElectronicBowl == "B") Button(onClick = { activeElectronicBowl = "B" }, modifier = Modifier.weight(1f)) { Text("Чаша B • $totalPercentB%") }
+                                else OutlinedButton(onClick = { activeElectronicBowl = "B" }, modifier = Modifier.weight(1f)) { Text("Чаша B • $totalPercentB%") }
+                            }
+                        }
+                    }
                     item {
-                        Text("Микс табака", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Text(if (bowl == "Электронная") "Микс • Чаша $activeElectronicBowl" else "Микс табака", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Text(
                             if (mixOptions.isEmpty()) "Сначала добавь табак и остатки в разделе «Полка»" else "Найди вкус по бренду, названию или дескриптору",
                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
@@ -1349,7 +1728,7 @@ private fun TableDialog(
                                             val loaded = favoriteComponents.mapNotNull { component ->
                                                 mixOptions.firstOrNull { it.flavorId == component.flavorId }?.let { it to component.percent }
                                             }
-                                            if (loaded.isNotEmpty()) selectedMix = loaded
+                                            if (loaded.isNotEmpty()) { if (bowl == "Электронная" && activeElectronicBowl == "B") selectedMixB = loaded else selectedMix = loaded }
                                         },
                                         label = { Text(favorite.name) }
                                     )
@@ -1374,8 +1753,8 @@ private fun TableDialog(
                             color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f)
                         )
                     }
-                    lazyItems(selectedMix, key = { it.first.flavorId }) { (option, percent) ->
-                        val grams = calculatedMix.firstOrNull { it.flavorId == option.flavorId }?.grams ?: 0.0
+                    lazyItems(editingMix, key = { it.first.flavorId }) { (option, percent) ->
+                        val grams = editingCalculatedMix.firstOrNull { it.flavorId == option.flavorId }?.grams ?: 0.0
                         Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(12.dp),
@@ -1386,31 +1765,41 @@ private fun TableDialog(
                                     Text("${option.brandName} • ${option.flavorName}", fontWeight = FontWeight.SemiBold)
                                     Text("${formatGrams(grams)} на чашу • остаток ${formatGrams(option.totalGrams)}", style = MaterialTheme.typography.bodySmall)
                                 }
-                                IconButton(onClick = {
-                                    selectedMix = selectedMix.map { if (it.first.flavorId == option.flavorId) it.first to (it.second - 5).coerceAtLeast(5) else it }
-                                }) { Icon(Icons.Outlined.Remove, null) }
-                                Text("$percent%", fontWeight = FontWeight.Bold)
-                                IconButton(onClick = {
-                                    selectedMix = selectedMix.map { if (it.first.flavorId == option.flavorId) it.first to (it.second + 5).coerceAtMost(100) else it }
-                                }) { Icon(Icons.Outlined.Add, null) }
-                                TextButton(onClick = { selectedMix = selectedMix.filterNot { it.first.flavorId == option.flavorId } }) { Text("Удалить") }
+                                Column(Modifier.width(190.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text("$percent%", fontWeight = FontWeight.Bold)
+                                    Slider(
+                                        value = percent.toFloat(),
+                                        onValueChange = { raw ->
+                                            val value = ((raw / 5f).roundToInt() * 5).coerceIn(5, 100)
+                                            if (bowl == "Электронная" && activeElectronicBowl == "B") selectedMixB = selectedMixB.map { if (it.first.flavorId == option.flavorId) it.first to value else it }
+                                            else selectedMix = selectedMix.map { if (it.first.flavorId == option.flavorId) it.first to value else it }
+                                        },
+                                        valueRange = 5f..100f,
+                                        steps = 18
+                                    )
+                                }
+                                TextButton(onClick = {
+                                    if (bowl == "Электронная" && activeElectronicBowl == "B") selectedMixB = selectedMixB.filterNot { it.first.flavorId == option.flavorId }
+                                    else selectedMix = selectedMix.filterNot { it.first.flavorId == option.flavorId }
+                                }) { Text("Удалить") }
                             }
                         }
                     }
                     item {
-                        val statusColor = if (totalPercent == 100 && enoughStock) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                        val editingTotalPercent = if (bowl == "Электронная" && activeElectronicBowl == "B") totalPercentB else totalPercent
+                        val statusColor = if (editingTotalPercent == 100 && enoughStock) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                         Text(
                             when {
-                                selectedMix.isEmpty() -> "Добавь хотя бы один вкус"
-                                totalPercent != 100 -> "Сумма микса: $totalPercent% — нужно ровно 100%"
+                                editingMix.isEmpty() -> "Добавь хотя бы один вкус"
+                                editingTotalPercent != 100 -> "Сумма микса: $editingTotalPercent% — нужно ровно 100%"
                                 !enoughStock -> "На полке недостаточно табака для этого кальяна"
-                                else -> "Готово: ${formatGrams(bowlWeight)} на чашу • будет списано ${formatGrams(bowlWeight)}"
+                                else -> if (bowl == "Электронная") "Чаша $activeElectronicBowl готова • для электронной нужны обе чаши A и B" else "Готово: ${formatGrams(bowlWeight)} на чашу • будет списано ${formatGrams(bowlWeight)}"
                             },
                             color = statusColor,
                             fontWeight = FontWeight.SemiBold
                         )
                     }
-                    if (selectedMix.isNotEmpty() && totalPercent == 100) {
+                    if (editingMix.isNotEmpty() && (if (bowl == "Электронная" && activeElectronicBowl == "B") totalPercentB else totalPercent) == 100) {
                         item {
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                                 OutlinedTextField(
@@ -1423,7 +1812,7 @@ private fun TableDialog(
                                 OutlinedButton(
                                     enabled = favoriteName.isNotBlank(),
                                     onClick = {
-                                        onSaveFavorite(favoriteName, calculatedMix)
+                                        onSaveFavorite(favoriteName, editingCalculatedMix)
                                         favoriteName = ""
                                     }
                                 ) { Text("Сохранить ⭐") }
@@ -1435,7 +1824,7 @@ private fun TableDialog(
             confirmButton = {
                 Button(
                     enabled = canStart,
-                    onClick = { onStart(guest, selectedGuestId, bowl, strength.roundToInt(), effectiveHookahCount, calculatedMix) }
+                    onClick = { onStart(guest, selectedGuestId, bowl, strength.roundToInt(), effectiveHookahCount, calculatedMix, calculatedMixB) }
                 ) { Text(if (addingHookah) "Добавить кальян" else "Создать кальян") }
             },
             dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
@@ -1444,15 +1833,17 @@ private fun TableDialog(
         if (flavorPickerOpen) {
             FlavorPickerDialog(
                 options = mixOptions,
-                selectedFlavorIds = selectedMix.map { it.first.flavorId }.toSet(),
+                selectedFlavorIds = editingMix.map { it.first.flavorId }.toSet(),
                 initialQuery = search,
                 onDismiss = {
                     flavorPickerOpen = false
                     search = ""
                 },
                 onSelect = { option ->
-                    val remaining = (100 - selectedMix.sumOf { it.second }).coerceAtLeast(10)
-                    selectedMix = selectedMix + (option to remaining.coerceAtMost(100))
+                    val current = if (bowl == "Электронная" && activeElectronicBowl == "B") selectedMixB else selectedMix
+                    val remaining = (100 - current.sumOf { it.second }).coerceAtLeast(10)
+                    if (bowl == "Электронная" && activeElectronicBowl == "B") selectedMixB = selectedMixB + (option to remaining.coerceAtMost(100))
+                    else selectedMix = selectedMix + (option to remaining.coerceAtMost(100))
                     flavorPickerOpen = false
                     search = ""
                 }
@@ -1479,25 +1870,43 @@ private fun TableDialog(
                     }
                     InfoLine("Чаша", hookah.bowlType)
                     InfoLine("Крепость", "${hookah.strength} / 10")
-                    InfoLine("Замен углей", hookah.coalChanges.toString())
+                    if (hookah.bowlType != "Электронная") InfoLine("Замен углей", "${hookah.coalChanges} / $MAX_COAL_CHANGES")
+                    InfoLine("Статус", if (hookah.deliveredAt == null) "Готовится" else "Отдан")
                     Divider()
                     Text("Микс", fontWeight = FontWeight.SemiBold)
+                    if (hookah.bowlType == "Электронная") Text("Чаша A", fontWeight = FontWeight.SemiBold)
                     hookah.mix.forEach { component ->
                         InfoLine("${component.brandName} • ${component.flavorName} (${component.percent}%)", formatGrams(component.grams))
                     }
+                    if (hookah.bowlType == "Электронная" && hookah.secondaryMix.isNotEmpty()) {
+                        Divider()
+                        Text("Чаша B", fontWeight = FontWeight.SemiBold)
+                        hookah.secondaryMix.forEach { component ->
+                            InfoLine("${component.brandName} • ${component.flavorName} (${component.percent}%)", formatGrams(component.grams))
+                        }
+                    }
                     Spacer(Modifier.height(4.dp))
-                    Text("До замены углей", style = MaterialTheme.typography.labelLarge)
+                    Text(if (hookah.bowlType == "Электронная") "Таймер электронной чаши" else "До замены углей", style = MaterialTheme.typography.labelLarge)
                     Text(
-                        coalTimerText(hookah, now),
+                        serviceTimerText(hookah, now),
                         style = MaterialTheme.typography.displaySmall,
                         fontWeight = FontWeight.Bold,
-                        color = if (now - hookah.lastCoalAt >= COAL_INTERVAL_MS) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                        color = if (hookah.deliveredAt != null && now - serviceReferenceAt(hookah) >= serviceIntervalMs(hookah)) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                         textAlign = TextAlign.Center,
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
             },
-            confirmButton = { Button(onClick = { onCoal(selectedHookahIndex) }) { Text("Угли заменены") } },
+            confirmButton = {
+                Button(onClick = { onCoal(selectedHookahIndex) }, enabled = hookah.deliveredAt != null && hookah.bowlType != "Электронная" && hookah.coalChanges < MAX_COAL_CHANGES) {
+                    Text(when {
+                        hookah.deliveredAt == null -> "Сначала отдай кальян"
+                        hookah.bowlType == "Электронная" -> "Таймер 40 минут"
+                        hookah.coalChanges >= MAX_COAL_CHANGES -> "Лимит замен достигнут"
+                        else -> "Угли заменены"
+                    })
+                }
+            },
             dismissButton = {
                 Column(horizontalAlignment = Alignment.End) {
                     Row {
@@ -1545,14 +1954,31 @@ private fun calculateMix(selected: List<Pair<MixFlavorOption, Int>>, bowlWeight:
     }
 }
 
-private fun coalTimerText(hookah: HookahSession, now: Long): String {
-    val remaining = COAL_INTERVAL_MS - (now - hookah.lastCoalAt)
+private fun serviceIntervalMs(hookah: HookahSession): Long =
+    if (hookah.bowlType == "Электронная") ELECTRONIC_INTERVAL_MS else COAL_INTERVAL_MS
+
+private fun serviceReferenceAt(hookah: HookahSession): Long =
+    if (hookah.bowlType == "Электронная") hookah.deliveredAt ?: hookah.startedAt else hookah.lastCoalAt
+
+private fun serviceTimerText(hookah: HookahSession, now: Long): String {
+    if (hookah.deliveredAt == null) return "Готовится"
+    val remaining = serviceIntervalMs(hookah) - (now - serviceReferenceAt(hookah))
     if (remaining <= 0) {
         val overdue = -remaining / 1000
         return "Просрочено ${overdue / 60}:${(overdue % 60).toString().padStart(2, '0')}"
     }
     val seconds = remaining / 1000
     return "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')}"
+}
+
+private fun playServiceAlert() {
+    runCatching {
+        val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90)
+        tone.startTone(ToneGenerator.TONE_PROP_BEEP2, 700)
+        Thread {
+            try { Thread.sleep(900) } finally { tone.release() }
+        }.start()
+    }
 }
 
 
