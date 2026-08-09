@@ -30,7 +30,7 @@ interface ShelfDao {
         FROM tobacco_flavors f JOIN tobacco_brands b ON b.id = f.brandId
         LEFT JOIN tobacco_containers c ON c.flavorId = f.id
         WHERE f.isAvailable = 1 GROUP BY f.id
-        HAVING COALESCE(SUM(CASE WHEN c.isActive = 1 THEN c.remainingGrams ELSE 0 END), 0) > 0
+        HAVING COALESCE(SUM(CASE WHEN c.isActive = 1 THEN c.remainingGrams ELSE 0 END), 0) > 5.0
         ORDER BY b.name COLLATE NOCASE, f.name COLLATE NOCASE
     """) fun observeMixOptions(): Flow<List<MixFlavorOption>>
 

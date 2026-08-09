@@ -13,8 +13,8 @@ android {
         applicationId = "ru.igni.manager"
         minSdk = 26
         targetSdk = 35
-        versionCode = 20
-        versionName = "5.0-alpha4.8.2-multi-hookah-ux"
+        versionCode = 22
+        versionName = "5.0-alpha4.8.4-shift-service-ux"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
