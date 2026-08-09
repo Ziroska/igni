@@ -1,0 +1,48 @@
+name: Apply Alpha 4.8.4 payload
+
+on:
+  push:
+    branches:
+      - alpha-4.8.4-shift-service-ux
+    paths:
+      - '.github/workflows/apply-alpha484.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: alpha-4.8.4-shift-service-ux
+          fetch-depth: 0
+
+      - name: Apply generated source files
+        shell: bash
+        run: |
+          set -euo pipefail
+          decode() {
+            local src="$1"
+            local dst="$2"
+            mkdir -p "$(dirname "$dst")"
+            base64 -d "$src" | gzip -d > "$dst"
+          }
+          decode .github/alpha484/IgniApp.kt.gz.b64 app/src/main/java/ru/igni/manager/ui/IgniApp.kt
+          decode .github/alpha484/ShelfDao.kt.gz.b64 app/src/main/java/ru/igni/manager/data/local/ShelfDao.kt
+          decode .github/alpha484/build.gradle.kts.gz.b64 app/build.gradle.kts
+          decode .github/alpha484/notes.gz.b64 ALPHA-4.8.4-NOTES.txt
+          rm -rf .github/alpha484
+          rm -f .github/workflows/apply-alpha484.yml
+
+      - name: Commit Alpha 4.8.4
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "OpenAI Codex Connector"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Alpha 4.8.4: shift and service UX"
+          git push origin alpha-4.8.4-shift-service-ux
