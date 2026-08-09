@@ -1,0 +1,52 @@
+name: Apply Alpha 4.8.4 payload
+
+on:
+  push:
+    branches:
+      - alpha-4.8.4-shift-service-ux
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: alpha-4.8.4-shift-service-ux
+          fetch-depth: 0
+
+      - name: Reconstruct Alpha 4.8.4 sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat \
+            .chatgpt/alpha484/payload.00 \
+            .chatgpt/alpha484/payload.01 \
+            .chatgpt/alpha484/payload.02 \
+            .chatgpt/alpha484/payload.03 \
+            .chatgpt/alpha484/payload.04 \
+            .chatgpt/alpha484/payload.05 \
+            .chatgpt/alpha484/payload.06 \
+            .chatgpt/alpha484/payload.07 \
+            | base64 -d > /tmp/alpha484.tar.gz
+          tar -xzf /tmp/alpha484.tar.gz
+          rm -rf .chatgpt/alpha484
+          rm -f .github/workflows/apply-alpha-484.yml
+
+      - name: Commit applied sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git commit -m "feat: Alpha 4.8.4 shift and service UX [skip ci]"
+          git push origin HEAD:alpha-4.8.4-shift-service-ux
