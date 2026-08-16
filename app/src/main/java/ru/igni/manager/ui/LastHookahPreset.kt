@@ -18,13 +18,14 @@ internal suspend fun loadLastHookahPreset(
     guestId: Long,
     mixOptions: List<MixFlavorOption>
 ): LastHookahPreset? {
-    val visits = crmDao.getVisits(guestId)
-    val lastHookah = visits.asSequence()
-        .mapNotNull { visit -> crmDao.getHookahsForVisit(visit.id).maxByOrNull { it.startedAt } }
-        .firstOrNull()
-        ?: return null
+    var lastHookah = null as ru.igni.manager.data.local.HookahHistoryEntity?
+    for (visit in crmDao.getVisits(guestId)) {
+        lastHookah = crmDao.getHookahsForVisit(visit.id).maxByOrNull { it.startedAt }
+        if (lastHookah != null) break
+    }
+    val resolvedHookah = lastHookah ?: return null
 
-    val historyItems = crmDao.getMixItemsForHookah(lastHookah.id)
+    val historyItems = crmDao.getMixItemsForHookah(resolvedHookah.id)
     if (historyItems.isEmpty()) return null
 
     val unavailable = mutableListOf<String>()
@@ -45,8 +46,8 @@ internal suspend fun loadLastHookahPreset(
     }
 
     return LastHookahPreset(
-        bowlType = lastHookah.bowlType,
-        strength = lastHookah.strength,
+        bowlType = resolvedHookah.bowlType,
+        strength = resolvedHookah.strength,
         mix = mapped,
         unavailableFlavors = unavailable.distinct()
     )
