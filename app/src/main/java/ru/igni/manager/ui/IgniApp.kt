@@ -745,7 +745,6 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                             val session = hallState.openTable(table.number, guest, linkedGuestId, bowl, strength, count, mix)
                             hallDao.saveSession(session.toEntity(table.number))
                         }
-                        selectedTable = null
                     } catch (error: Exception) {
                         snackbarHostState.showSnackbar(error.message ?: "Не удалось списать табак")
                     }
@@ -1175,11 +1174,11 @@ private fun ActiveTableSidePanel(
             Button(onClick = { onCoal(selectedHookah) }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
                 Text("Заменить угли")
             }
-            OutlinedButton(onClick = { onRepeat(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Добавить новый кальян")
+            Button(onClick = { onDuplicate(selectedHookah) }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                Text("Повторить текущий кальян")
             }
-            TextButton(onClick = { onDuplicate(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Дублировать текущий кальян")
+            OutlinedButton(onClick = { onRepeat(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Новый кальян")
             }
             if (session.hookahCount > 1) {
                 TextButton(onClick = { onRemove(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
