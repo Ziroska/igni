@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import ru.igni.manager.data.local.DatabaseBackup
 import ru.igni.manager.data.local.IgniDatabase
 import ru.igni.manager.data.local.ShelfSeeder
 
@@ -15,6 +16,7 @@ class IgniApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        DatabaseBackup.backupBeforeOpen(this)
         applicationScope.launch {
             ShelfSeeder.seedIfEmpty(database)
         }
