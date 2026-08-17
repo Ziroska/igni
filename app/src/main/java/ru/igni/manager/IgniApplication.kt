@@ -1,6 +1,7 @@
 package ru.igni.manager
 
 import android.app.Application
+import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -18,7 +19,23 @@ class IgniApplication : Application() {
         super.onCreate()
         DatabaseBackup.backupBeforeOpen(this)
         applicationScope.launch {
+            initializeShelfOnce()
+        }
+    }
+
+    private suspend fun initializeShelfOnce() {
+        val prefs = getSharedPreferences(DATA_SAFETY_PREFS, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(SHELF_INITIALIZED, false)) return
+
+        if (database.shelfDao().countBrands() == 0) {
             ShelfSeeder.seedIfEmpty(database)
         }
+
+        prefs.edit().putBoolean(SHELF_INITIALIZED, true).apply()
+    }
+
+    private companion object {
+        const val DATA_SAFETY_PREFS = "igni_data_safety"
+        const val SHELF_INITIALIZED = "shelf_initialized"
     }
 }
