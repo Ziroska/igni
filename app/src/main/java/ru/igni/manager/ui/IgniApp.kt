@@ -745,7 +745,6 @@ private fun HallScreen(onBack: () -> Unit, hallState: HallState) {
                             val session = hallState.openTable(table.number, guest, linkedGuestId, bowl, strength, count, mix)
                             hallDao.saveSession(session.toEntity(table.number))
                         }
-                        selectedTable = null
                     } catch (error: Exception) {
                         snackbarHostState.showSnackbar(error.message ?: "Не удалось списать табак")
                     }
@@ -1175,11 +1174,11 @@ private fun ActiveTableSidePanel(
             Button(onClick = { onCoal(selectedHookah) }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
                 Text("Заменить угли")
             }
-            OutlinedButton(onClick = { onRepeat(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Добавить новый кальян")
+            Button(onClick = { onDuplicate(selectedHookah) }, modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                Text("Повторить текущий кальян")
             }
-            TextButton(onClick = { onDuplicate(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
-                Text("Дублировать текущий кальян")
+            OutlinedButton(onClick = { onRepeat(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
+                Text("Новый кальян")
             }
             if (session.hookahCount > 1) {
                 TextButton(onClick = { onRemove(selectedHookah) }, modifier = Modifier.fillMaxWidth()) {
@@ -1222,6 +1221,9 @@ private fun TableDialog(
         var selectedMix by remember { mutableStateOf<List<Pair<MixFlavorOption, Int>>>(emptyList()) }
         var favoriteName by remember { mutableStateOf("") }
         var guestSuggestionsExpanded by remember { mutableStateOf(false) }
+        var lastHookahPreset by remember { mutableStateOf<LastHookahPreset?>(null) }
+        var lastHookahLoading by remember { mutableStateOf(false) }
+        val scope = rememberCoroutineScope()
         val context = LocalContext.current
         val crmDao = remember { (context.applicationContext as IgniApplication).database.crmDao() }
         val guestQuery = guest.trim()
@@ -1254,6 +1256,8 @@ private fun TableDialog(
                                     onValueChange = {
                                         guest = it
                                         selectedGuestId = null
+                                        lastHookahPreset = null
+                                        lastHookahLoading = false
                                         guestSuggestionsExpanded = it.isNotBlank()
                                     },
                                     label = { Text("Имя гостя") },
@@ -1274,9 +1278,21 @@ private fun TableDialog(
                                                         .clickable {
                                                             guest = savedGuest.name
                                                             selectedGuestId = savedGuest.id
+                                                            lastHookahPreset = null
+                                                            lastHookahLoading = true
                                                             savedGuest.preferredStrength?.let { strength = it.toFloat().coerceIn(1f, 10f) }
                                                             savedGuest.preferredBowlType?.takeIf { it.isNotBlank() }?.let { bowl = it }
                                                             guestSuggestionsExpanded = false
+                                                            val loadingGuestId = savedGuest.id
+                                                            scope.launch {
+                                                                val loadedPreset = runCatching {
+                                                                    loadLastHookahPreset(crmDao, loadingGuestId, mixOptions)
+                                                                }.getOrNull()
+                                                                if (selectedGuestId == loadingGuestId) {
+                                                                    lastHookahPreset = loadedPreset
+                                                                    lastHookahLoading = false
+                                                                }
+                                                            }
                                                         }
                                                         .padding(horizontal = 12.dp, vertical = 10.dp),
                                                     verticalAlignment = Alignment.CenterVertically,
@@ -1299,6 +1315,42 @@ private fun TableDialog(
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (selectedGuestId != null) {
+                            item {
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(
+                                        modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text("Последний кальян", fontWeight = FontWeight.Bold)
+                                        val preset = lastHookahPreset
+                                        when {
+                                            lastHookahLoading -> Text("Загружаем последний заказ…")
+                                            preset == null -> Text("В истории пока нет сохранённого кальяна")
+                                            preset.unavailableFlavors.isNotEmpty() -> Text(
+                                                "Последний кальян найден, но сейчас недоступны: ${preset.unavailableFlavors.joinToString(", ")}",
+                                                color = MaterialTheme.colorScheme.error
+                                            )
+                                            preset.canApply -> {
+                                                Text("Чаша: ${preset.bowlType} • крепость: ${preset.strength} / 10")
+                                                Text(preset.mix.joinToString(" • ") { it.first.flavorName })
+                                                Button(onClick = {
+                                                    bowl = preset.bowlType
+                                                    strength = preset.strength.toFloat().coerceIn(1f, 10f)
+                                                    selectedMix = preset.mix
+                                                }) {
+                                                    Text("Повторить последний кальян")
+                                                }
+                                            }
+                                            else -> Text("Последний кальян нельзя безопасно повторить")
                                         }
                                     }
                                 }
